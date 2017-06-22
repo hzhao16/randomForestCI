@@ -1,0 +1,197 @@
+import functools
+import scipy.interpolate
+import itertools
+import math
+from scipy.optimize import minimize
+from scipy.signal import fftconvolve
+import pandas as pd
+import numpy as np
+import time
+from matplotlib import pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.datasets.mldata import fetch_mldata
+from scipy.stats import norm
+import copy
+import forestci as fci
+
+mpg_data = pd.read_csv(path+'\downloads\data.csv')
+mpg_data.fillna(0,inplace=True)
+
+# separate mpg data into predictors and outcome variable
+mpg_X = mpg_data[["#gp_coupon_reset Rate","Composite Rating","spread_vwap","#gp_2a7_dtm"]]
+mpg_y = mpg_data["#gp_oas"]
+
+# split mpg data into training and test set
+mpg_X_train, mpg_X_test, mpg_y_train, mpg_y_test = train_test_split(
+                                                   mpg_X, mpg_y,
+                                                   test_size=0.3,
+                                                   random_state=42)
+                                                   
+t1 = time.time()
+# create RandomForestRegressor
+n_trees = 1000
+mpg_forest = RandomForestRegressor(n_estimators=n_trees, random_state=42)
+mpg_forest.fit(mpg_X_train, mpg_y_train)
+mpg_y_hat = mpg_forest.predict(mpg_X_test)
+t2 = time.time()
+print("Training ", t2-t1)
+
+# calculate inbag and unbiased variance
+mpg_inbag = fci.calc_inbag(mpg_X_train.shape[0], mpg_forest)
+mpg_V_IJ_unbiased = fci.random_forest_error(mpg_forest,mpg_X_train, mpg_X_test)
+t3 = time.time()
+
+print("Calculating CI ", t3-t2)
+
+def neg_loglik(eta):
+    mask = np.ones_like(xvals)
+    mask[np.where(xvals <= 0)[0]] = 0
+    g_eta_raw = np.exp(np.dot(XX, eta)) * mask
+    if ((sum(g_eta_raw) == math.inf) |(sum(g_eta_raw) <= 100 * np.finfo(np.double).tiny)):
+        return (1000 * (len(X) + sum(eta ** 2)))
+
+    g_eta_main = g_eta_raw / sum(g_eta_raw)
+    g_eta = (1 - unif_fraction) * g_eta_main + unif_fraction * mask / sum(mask)
+    f_eta = fftconvolve(g_eta, noise_rotate, mode='same')  ####
+
+    return np.sum(np.interp(X, xvals, -np.log(np.maximum(f_eta, 0.0000001)))) 
+
+
+def gfit(X, sigma, p=2, nbin=10000, unif_fraction=0.1):
+    """
+    Fit an empirical Bayes prior in the hierarchical model
+        mu ~ G, X ~ N(mu, sigma^2)
+    Parameters
+    ----------
+    X: ndarray
+        A 1D array of observations
+    sigma: float
+        noise estimate on X
+    p: int
+        tuning parameter -- number of parameters used to fit G
+    nbin: int
+        tuning parameter -- number of bins used for discrete approximation
+    unif_fraction: float
+        tuning parameter -- fraction of G modeled as "slab"
+    Returns
+    -------
+    An array of the posterior density estimate g
+    Notes
+    -----
+    .. [Efron2014] B Efron. "Two modeling strategies for empirical Bayes
+        estimation." Stat. Sci., 29(2): 285–301, 2014.
+    """
+    min_x = min(min(X) - 2 * np.std(X,ddof=1), 0)
+    max_x = max(max(X) + 2 * np.std(X,ddof=1), np.std(X,ddof=1))
+    xvals = np.linspace(min_x, max_x, nbin)
+    binw = (max_x - min_x) / (nbin - 1)
+    
+    zero_idx = max(np.where(xvals <= 0)[0])
+    noise_kernel = norm().pdf(xvals / sigma) * binw / sigma
+
+    if zero_idx > 0:
+        noise_rotate = noise_kernel[list(np.arange(zero_idx, len(xvals))) +
+                                    list(np.arange(0, zero_idx))]
+    else:
+        noise_rotate = noise_kernel
+
+    XX = np.zeros((p, len(xvals)), dtype=np.float)
+    for ind, exp in enumerate(range(1,p+1)):
+        mask = np.ones_like(xvals)
+        mask[np.where(xvals <= 0)[0]] = 0
+        XX[ind, :] = pow(xvals, exp) * mask
+    XX = XX.T
+    eta_hat = minimize(neg_loglik, list(itertools.repeat(-1, p))).x  ###??
+    g_eta_raw = np.exp(np.dot(XX, eta_hat)) * mask
+    g_eta_main = g_eta_raw / sum(g_eta_raw)
+    g_eta = ((1 - unif_fraction) * g_eta_main + unif_fraction * mask) / sum(mask)
+
+    return xvals, g_eta
+
+
+def gbayes(x0, g_est, sigma):
+    """
+    Bayes posterior estimation with Gaussian noise
+    Parameters
+    ----------
+    x0: ndarray
+        an observation
+    g_est: float
+        a prior density, as returned by gfit
+    sigma: int
+        noise estimate
+    Returns
+    -------
+    An array of the posterior estimate E[mu | x0]
+    Notes
+    -----
+     .. [Efron2014] B Efron. "Two modeling strategies for empirical Bayes
+          estimation." Stat. Sci., 29(2): 285–301, 2014.
+    """
+
+    Kx = norm().pdf((g_est[0] - x0) / sigma)
+    post = Kx * g_est[1]
+    post = post/ sum(post)
+    return sum(post * g_est[0])
+
+
+def calibrateEB(variances, sigma2):
+    """
+    Empirical Bayes calibration of noisy variance estimates
+    Parameters
+    ----------
+    vars: ndarray
+        list of variance estimates
+    sigma2: int
+        estimate of the Monte Carlo noise in vars
+    Returns
+    -------
+    An array of the calibrated variance estimates
+    Notes
+    -----
+     .. [Efron2014] B Efron. "Two modeling strategies for empirical Bayes
+          estimation." Stat. Sci., 29(2): 285–301, 2014.
+    """
+
+    if (sigma2 <= 0 or min(variances) == max(variances)):
+        return(np.maximum(variances, 0))
+    
+    sigma = sigma2**0.5
+    eb_prior = gfit(variances, sigma)
+    
+    '''
+    if (len(variances) >= 200):
+        # If there are many  points use interpolation to speed up computations
+        calib_x = np.percentile(variances, np.arange(0, 1.02, .02))
+        #calib_y = list(map(gbayes(xx, eb_prior, sigma), calib_x))
+        calib_y = map(functools.partial(gbayes, g_est=eb_prior, sigma=sigma),
+                      calib_x)
+        calib_all = scipy.interpolate.interp1d(calib_x, calib_y, variances)
+    else:
+        calib_all = map(functools.partial(gbayes, g_est=eb_prior, sigma=sigma),
+                        variances)
+    '''
+    calib_all = map(functools.partial(gbayes, g_est=eb_prior, sigma=sigma),
+                        #variances)
+                        
+    return(list(calib_all))
+    
+    # Compute variance estimates using half the trees
+calibration_ratio = 2
+n_sample = np.ceil(n_trees / calibration_ratio)
+new_forest = copy.deepcopy(mpg_forest)
+new_forest.estimators_ = np.random.permutation(new_forest.estimators_)[:int(n_sample)]
+new_forest.n_estimators = int(n_sample)
+
+results_ss = fci.random_forest_error(new_forest, mpg_X_train, mpg_X_test)
+# Use this second set of variance estimates
+# to estimate scale of Monte Carlo noise
+sigma2_ss = np.mean((results_ss - mpg_V_IJ_unbiased)**2)
+delta = n_sample / n_trees
+sigma2 = (delta**2 + (1 - delta)**2) / (2 * (1 - delta)**2) * sigma2_ss
+
+# Use Monte Carlo noise scale estimate for empirical Bayes calibration
+mpg_V_IJ_calibrated = calibrateEB(mpg_V_IJ_unbiased, sigma2)
+#mpg_V_IJ_calibrated
+    
